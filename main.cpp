@@ -1,5 +1,4 @@
-#include <windows.h>
-#include <vulkan/vulkan.h>
+#include <GLFW/glfw3.h>
 #include <shaderc/shaderc.hpp>
 #include <glm/glm.hpp>
 
@@ -15,7 +14,7 @@
 
 namespace
 {
-constexpr wchar_t WindowName[] = L"Vulkan Triangle";
+constexpr char WindowName[] = "Vulkan Triangle";
 constexpr uint32_t WindowWidth = 800;
 constexpr uint32_t WindowHeight = 600;
 constexpr uint32_t VertexCount = 3;
@@ -63,19 +62,22 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debugLog(
     VkDebugUtilsMessageTypeFlagsEXT,
     const VkDebugUtilsMessengerCallbackDataEXT* data, void*)
 {
-    OutputDebugStringA(data->pMessage);
-    OutputDebugStringA("\n");
     std::fprintf(stderr, "%s\n", data->pMessage);
     return VK_FALSE;
+}
+
+void glfwLog(int, const char* message)
+{
+    std::fprintf(stderr, "%s\n", message);
 }
 }
 
 class Triangle
 {
-    friend int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int);
+    friend int main();
 
-    HINSTANCE module = GetModuleHandleW(nullptr);
-    HWND window = nullptr;
+    GLFWwindow* window = nullptr;
+    bool glfwReady = false;
     bool resized = false;
     VkInstance instance = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
@@ -99,60 +101,61 @@ class Triangle
     VkSemaphore acquired = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
 
-    static LRESULT CALLBACK windowProc(HWND handle, UINT message, WPARAM wParam, LPARAM lParam)
+    static void resizeWindow(GLFWwindow* handle, int, int)
     {
-        auto* app = reinterpret_cast<Triangle*>(GetWindowLongPtrW(handle, GWLP_USERDATA));
-        if (message == WM_NCCREATE)
-        {
-            app = static_cast<Triangle*>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams);
-            SetWindowLongPtrW(handle, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
-        }
+        auto* app = static_cast<Triangle*>(glfwGetWindowUserPointer(handle));
+        app->resized = true;
+    }
 
-        if (message == WM_SIZE && app)
+    static void keyPress(GLFWwindow* handle, int key, int, int action, int)
+    {
+        if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
         {
-            app->resized = true;
+            glfwSetWindowShouldClose(handle, GLFW_TRUE);
         }
-
-        if (message == WM_CLOSE || (message == WM_KEYDOWN && wParam == VK_ESCAPE))
-        {
-            PostQuitMessage(0);
-            return 0;
-        }
-
-        return DefWindowProcW(handle, message, wParam, lParam);
     }
 
     void createWindow()
     {
-        WNDCLASSW info{};
-        info.lpfnWndProc = windowProc;
-        info.hInstance = module;
-        info.lpszClassName = WindowName;
-        info.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        if (!RegisterClassW(&info))
+        glfwSetErrorCallback(glfwLog);
+        if (!glfwInit())
         {
-            throw std::runtime_error("RegisterClassW failed");
+            throw std::runtime_error("GLFW initialization failed");
+        }
+        glfwReady = true;
+        if (!glfwVulkanSupported())
+        {
+            throw std::runtime_error("Vulkan unavailable");
         }
 
-        constexpr DWORD WindowStyle = WS_OVERLAPPEDWINDOW;
-        RECT bounds{0, 0, WindowWidth, WindowHeight};
-        AdjustWindowRect(&bounds, WindowStyle, FALSE);
-        window = CreateWindowW(WindowName, WindowName, WindowStyle,
-            CW_USEDEFAULT, CW_USEDEFAULT, bounds.right - bounds.left,
-            bounds.bottom - bounds.top, nullptr, nullptr, module, this);
+        // Vulkan 不需要 OpenGL 上下文；初始化完成后再显示窗口。
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+        glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+        window = glfwCreateWindow(WindowWidth, WindowHeight, WindowName, nullptr, nullptr);
+
         if (!window)
         {
-            throw std::runtime_error("CreateWindowW failed");
+            throw std::runtime_error("GLFW window creation failed");
         }
+        glfwSetWindowUserPointer(window, this);
+        glfwSetFramebufferSizeCallback(window, resizeWindow);
+        glfwSetKeyCallback(window, keyPress);
     }
 
     void createInstance()
     {
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-        app.pApplicationName = "Vulkan Triangle";
+        app.pApplicationName = WindowName;
         app.apiVersion = VK_API_VERSION_1_0;
 
-        std::vector<const char*> extensions{VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+        // GLFW 提供当前平台所需的 surface 扩展。
+        uint32_t extensionCount = 0;
+        const char** required = glfwGetRequiredInstanceExtensions(&extensionCount);
+        if (!required)
+        {
+            throw std::runtime_error("GLFW Vulkan surface extensions unavailable");
+        }
+        std::vector<const char*> extensions(required, required + extensionCount);
         VkInstanceCreateInfo info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         info.pApplicationInfo = &app;
         VkDebugUtilsMessengerCreateInfoEXT debug{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
@@ -194,10 +197,7 @@ class Triangle
             check(create(instance, &debug, nullptr, &messenger), "Create debug messenger");
         }
 
-        VkWin32SurfaceCreateInfoKHR surfaceInfo{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
-        surfaceInfo.hinstance = module;
-        surfaceInfo.hwnd = window;
-        check(vkCreateWin32SurfaceKHR(instance, &surfaceInfo, nullptr, &surface), "Create surface");
+        check(glfwCreateWindowSurface(instance, window, nullptr, &surface), "Create surface");
     }
 
     bool selectGpu(VkPhysicalDevice candidate)
@@ -414,10 +414,11 @@ class Triangle
         extent = caps.currentExtent;
         if (extent.width == std::numeric_limits<uint32_t>::max())
         {
-            RECT client{};
-            GetClientRect(window, &client);
-            extent.width = std::clamp(static_cast<uint32_t>(client.right), caps.minImageExtent.width, caps.maxImageExtent.width);
-            extent.height = std::clamp(static_cast<uint32_t>(client.bottom), caps.minImageExtent.height, caps.maxImageExtent.height);
+            int width = 0;
+            int height = 0;
+            glfwGetFramebufferSize(window, &width, &height);
+            extent.width = std::clamp(static_cast<uint32_t>(width), caps.minImageExtent.width, caps.maxImageExtent.width);
+            extent.height = std::clamp(static_cast<uint32_t>(height), caps.minImageExtent.height, caps.maxImageExtent.height);
         }
         uint32_t imageCount = caps.minImageCount + 1;
         if (caps.maxImageCount && imageCount > caps.maxImageCount)
@@ -647,9 +648,12 @@ class Triangle
         }
         if (window)
         {
-            DestroyWindow(window);
+            glfwDestroyWindow(window);
         }
-        UnregisterClassW(WindowName, module);
+        if (glfwReady)
+        {
+            glfwTerminate();
+        }
     }
 
     void run()
@@ -659,27 +663,22 @@ class Triangle
         createDevice();
         createCommands();
         createSwapchain();
-        ShowWindow(window, SW_SHOW);
-        MSG message{};
-        while (true)
+        glfwShowWindow(window);
+        while (!glfwWindowShouldClose(window))
         {
-            if (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
+            glfwPollEvents();
+            if (glfwWindowShouldClose(window))
             {
-                if (message.message == WM_QUIT)
-                {
-                    break;
-                }
-                TranslateMessage(&message);
-                DispatchMessageW(&message);
-                continue;
+                break;
             }
 
-            // 最小化暂停，窗口尺寸改变时重建交换链。
-            RECT client{};
-            GetClientRect(window, &client);
-            if (IsIconic(window) || client.right == 0 || client.bottom == 0)
+            // 使用像素尺寸；最小化时等待事件，避免空转。
+            int width = 0;
+            int height = 0;
+            glfwGetFramebufferSize(window, &width, &height);
+            if (glfwGetWindowAttrib(window, GLFW_ICONIFIED) || width == 0 || height == 0)
             {
-                WaitMessage();
+                glfwWaitEvents();
                 continue;
             }
             if (resized)
@@ -693,7 +692,7 @@ class Triangle
     }
 };
 
-int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
+int main()
 {
     try
     {
@@ -703,9 +702,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     }
     catch (const std::exception& error)
     {
-        OutputDebugStringA(error.what());
         std::fprintf(stderr, "%s\n", error.what());
-        MessageBoxA(nullptr, error.what(), "Vulkan error", MB_OK | MB_ICONERROR);
         return 1;
     }
 }

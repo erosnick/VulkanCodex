@@ -18,6 +18,7 @@
     <VulkanSdkVersion>1.4.363.0</VulkanSdkVersion>
     <VulkanSdkDir Condition="'$(VulkanSdkDir)' == '' and Exists('$(VULKAN_SDK)\..\$(VulkanSdkVersion)\Include\vulkan\vulkan.h')">$(VULKAN_SDK)\..\$(VulkanSdkVersion)</VulkanSdkDir>
     <VulkanSdkDir Condition="'$(VulkanSdkDir)' == ''">D:\Development\VulkanSDK\$(VulkanSdkVersion)</VulkanSdkDir>
+    <GlfwDir>$(ProjectDir)..\glfw-3.5.1.bin.WIN64</GlfwDir>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Label="Configuration">
@@ -42,20 +43,22 @@ $(LocalDebuggerEnvironment)</LocalDebuggerEnvironment>
       <ConformanceMode>true</ConformanceMode>
       <ExceptionHandling>Sync</ExceptionHandling>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalIncludeDirectories>$(VulkanSdkDir)\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;_WINDOWS;UNICODE;_UNICODE;NOMINMAX;VK_USE_PLATFORM_WIN32_KHR;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <PreprocessorDefinitions Condition="'$(Configuration)' == 'Debug'">_DEBUG;WIN32;_WINDOWS;UNICODE;_UNICODE;NOMINMAX;VK_USE_PLATFORM_WIN32_KHR;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(VulkanSdkDir)\Include;$(GlfwDir)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>GLFW_DLL;GLFW_INCLUDE_VULKAN;GLFW_INCLUDE_NONE;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions Condition="'$(Configuration)' == 'Debug'">_DEBUG;GLFW_DLL;GLFW_INCLUDE_VULKAN;GLFW_INCLUDE_NONE;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <Optimization Condition="'$(Configuration)' == 'Debug'">Disabled</Optimization>
       <Optimization Condition="'$(Configuration)' == 'Release'">MaxSpeed</Optimization>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalLibraryDirectories>$(VulkanSdkDir)\Lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>vulkan-1.lib;shaderc_shared.lib;user32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <EntryPointSymbol>mainCRTStartup</EntryPointSymbol>
+      <AdditionalLibraryDirectories>$(VulkanSdkDir)\Lib;$(GlfwDir)\lib-vc2026;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>vulkan-1.lib;shaderc_shared.lib;glfw3dll.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
     <PostBuildEvent>
-      <Command>copy /Y "$(VulkanSdkDir)\Bin\shaderc_shared.dll" "$(OutDir)"</Command>
+      <Command>copy /Y "$(VulkanSdkDir)\Bin\shaderc_shared.dll" "$(OutDir)"
+copy /Y "$(GlfwDir)\lib-vc2026\glfw3.dll" "$(OutDir)"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -64,5 +67,6 @@ $(LocalDebuggerEnvironment)</LocalDebuggerEnvironment>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <Target Name="CheckVulkanSdk" BeforeTargets="PrepareForBuild">
     <Error Condition="!Exists('$(VulkanSdkDir)\Include\glm\glm.hpp')" Text="Vulkan SDK $(VulkanSdkVersion) with GLM is required. Set VulkanSdkDir to its installation directory." />
+    <Error Condition="!Exists('$(GlfwDir)\lib-vc2026\glfw3dll.lib')" Text="GLFW 3.5.1 VS2026 binaries are required in $(GlfwDir)." />
   </Target>
 </Project>
