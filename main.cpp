@@ -18,7 +18,16 @@ constexpr char WindowName[] = "Vulkan Triangle";
 constexpr uint32_t WindowWidth = 800;
 constexpr uint32_t WindowHeight = 600;
 constexpr uint32_t VertexCount = 3;
+constexpr uint32_t QuadVertexCount = 6;
 constexpr uint32_t ColorChannels = 3;
+constexpr uint32_t TextureSize = 256;
+constexpr uint32_t CheckerCellSize = 32;
+constexpr uint32_t TextureChannels = 4;
+constexpr uint8_t CheckerGray = 153;
+constexpr uint8_t CheckerWhite = 230;
+constexpr uint8_t OpaqueAlpha = 255;
+constexpr VkFormat TextureFormat = VK_FORMAT_R8G8B8A8_UNORM;
+constexpr VkDeviceSize TextureBytes = TextureSize * TextureSize * TextureChannels;
 constexpr uint64_t InfiniteTimeout = std::numeric_limits<uint64_t>::max();
 constexpr char ValidationLayer[] = "VK_LAYER_KHRONOS_validation";
 constexpr char ShaderEntry[] = "main";
@@ -46,6 +55,35 @@ layout(location = 0) in vec3 color;
 layout(location = 0) out vec4 outColor;
 void main() {
     outColor = vec4(color, 1.0);
+}
+)glsl";
+
+// 两个三角形组成正方形；UV 覆盖整张棋盘格。
+constexpr char QuadVertexShader[] = R"glsl(
+#version 450
+const int VertexCount = 6;
+const vec2 positions[VertexCount] = vec2[](
+    vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(1.0, 1.0),
+    vec2(-1.0, -1.0), vec2(1.0, 1.0), vec2(-1.0, 1.0)
+);
+layout(push_constant) uniform Square {
+    vec4 scale;
+} square;
+layout(location = 0) out vec2 uv;
+void main() {
+    vec2 position = positions[gl_VertexIndex];
+    gl_Position = vec4(position * square.scale.xy, 0.0, 1.0);
+    uv = (position + 1.0) * 0.5;
+}
+)glsl";
+
+constexpr char QuadFragmentShader[] = R"glsl(
+#version 450
+layout(set = 0, binding = 0) uniform sampler2D checker;
+layout(location = 0) in vec2 uv;
+layout(location = 0) out vec4 outColor;
+void main() {
+    outColor = texture(checker, uv);
 }
 )glsl";
 
@@ -96,6 +134,16 @@ class Triangle
     VkRenderPass renderPass = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipeline quadPipeline = VK_NULL_HANDLE;
+    VkBuffer uploadBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory uploadMemory = VK_NULL_HANDLE;
+    VkImage texture = VK_NULL_HANDLE;
+    VkDeviceMemory textureMemory = VK_NULL_HANDLE;
+    VkImageView textureView = VK_NULL_HANDLE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout textureLayout = VK_NULL_HANDLE;
+    VkDescriptorPool descriptors = VK_NULL_HANDLE;
+    VkDescriptorSet textureSet = VK_NULL_HANDLE;
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer command = VK_NULL_HANDLE;
     VkSemaphore acquired = VK_NULL_HANDLE;
@@ -266,6 +314,168 @@ class Triangle
         vkGetDeviceQueue(device, queueFamily, 0, &queue);
     }
 
+    void allocateMemory(const VkMemoryRequirements& requirements,
+        VkMemoryPropertyFlags flags, VkDeviceMemory* memory)
+    {
+        VkPhysicalDeviceMemoryProperties properties{};
+        vkGetPhysicalDeviceMemoryProperties(gpu, &properties);
+        for (uint32_t index = 0; index < properties.memoryTypeCount; ++index)
+        {
+            if (!(requirements.memoryTypeBits & (1u << index)) ||
+                (properties.memoryTypes[index].propertyFlags & flags) != flags)
+            {
+                continue;
+            }
+
+            VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            info.allocationSize = requirements.size;
+            info.memoryTypeIndex = index;
+            check(vkAllocateMemory(device, &info, nullptr, memory), "Allocate texture memory");
+            return;
+        }
+        throw std::runtime_error("No compatible texture memory type");
+    }
+
+    void uploadTexture()
+    {
+        // 先允许传输写入，再允许片段着色器读取。
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        check(vkBeginCommandBuffer(command, &begin), "Begin texture upload");
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = texture;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {TextureSize, TextureSize, 1};
+        vkCmdCopyBufferToImage(command, uploadBuffer, texture, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &barrier);
+        check(vkEndCommandBuffer(command), "End texture upload");
+
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &command;
+        check(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE), "Submit texture upload");
+        check(vkQueueWaitIdle(queue), "Wait for texture upload");
+        vkDestroyBuffer(device, uploadBuffer, nullptr);
+        vkFreeMemory(device, uploadMemory, nullptr);
+        uploadBuffer = VK_NULL_HANDLE;
+        uploadMemory = VK_NULL_HANDLE;
+    }
+
+    void createDescriptors()
+    {
+        // binding 0 对应 GLSL 的 sampler2D。
+        VkDescriptorSetLayoutBinding binding{};
+        binding.binding = 0;
+        binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        binding.descriptorCount = 1;
+        binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        layoutInfo.bindingCount = 1;
+        layoutInfo.pBindings = &binding;
+        check(vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &textureLayout), "Create texture layout");
+
+        VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+        VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = &size;
+        check(vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptors), "Create descriptor pool");
+        VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocation.descriptorPool = descriptors;
+        allocation.descriptorSetCount = 1;
+        allocation.pSetLayouts = &textureLayout;
+        check(vkAllocateDescriptorSets(device, &allocation, &textureSet), "Allocate texture descriptor");
+
+        VkDescriptorImageInfo image{sampler, textureView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = textureSet;
+        write.dstBinding = binding.binding;
+        write.descriptorCount = 1;
+        write.descriptorType = binding.descriptorType;
+        write.pImageInfo = &image;
+        vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+    }
+
+    void createTexture()
+    {
+        // C++ 生成 8×8 灰白棋盘格，不依赖图片文件。
+        std::vector<uint8_t> pixels(static_cast<size_t>(TextureBytes));
+        for (uint32_t y = 0; y < TextureSize; ++y)
+        {
+            for (uint32_t x = 0; x < TextureSize; ++x)
+            {
+                const bool white = ((x / CheckerCellSize + y / CheckerCellSize) % 2) == 0;
+                const uint8_t shade = white ? CheckerWhite : CheckerGray;
+                const size_t offset = (static_cast<size_t>(y) * TextureSize + x) * TextureChannels;
+                std::fill_n(pixels.data() + offset, ColorChannels, shade);
+                pixels[offset + ColorChannels] = OpaqueAlpha;
+            }
+        }
+
+        // 暂存缓冲可由 CPU 写入；采样图像驻留 GPU。
+        VkBufferCreateInfo buffer{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        buffer.size = TextureBytes;
+        buffer.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        buffer.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        check(vkCreateBuffer(device, &buffer, nullptr, &uploadBuffer), "Create upload buffer");
+        VkMemoryRequirements requirements{};
+        vkGetBufferMemoryRequirements(device, uploadBuffer, &requirements);
+        allocateMemory(requirements, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &uploadMemory);
+        check(vkBindBufferMemory(device, uploadBuffer, uploadMemory, 0), "Bind upload memory");
+        void* mapped = nullptr;
+        check(vkMapMemory(device, uploadMemory, 0, TextureBytes, 0, &mapped), "Map upload buffer");
+        std::memcpy(mapped, pixels.data(), pixels.size());
+        vkUnmapMemory(device, uploadMemory);
+
+        VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        image.imageType = VK_IMAGE_TYPE_2D;
+        image.format = TextureFormat;
+        image.extent = {TextureSize, TextureSize, 1};
+        image.mipLevels = 1;
+        image.arrayLayers = 1;
+        image.samples = VK_SAMPLE_COUNT_1_BIT;
+        image.tiling = VK_IMAGE_TILING_OPTIMAL;
+        image.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        image.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        image.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        check(vkCreateImage(device, &image, nullptr, &texture), "Create checker texture");
+        vkGetImageMemoryRequirements(device, texture, &requirements);
+        allocateMemory(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &textureMemory);
+        check(vkBindImageMemory(device, texture, textureMemory, 0), "Bind texture memory");
+        uploadTexture();
+
+        VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view.image = texture;
+        view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view.format = TextureFormat;
+        view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        check(vkCreateImageView(device, &view, nullptr, &textureView), "Create texture view");
+        VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        samplerInfo.magFilter = VK_FILTER_NEAREST;
+        samplerInfo.minFilter = VK_FILTER_NEAREST;
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        check(vkCreateSampler(device, &samplerInfo, nullptr, &sampler), "Create texture sampler");
+        createDescriptors();
+    }
+
     VkShaderModule compile(const char* source, shaderc_shader_kind kind)
     {
         shaderc::Compiler compiler;
@@ -317,15 +527,23 @@ class Triangle
 
         VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(TriangleData)};
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.setLayoutCount = 1;
+        layoutInfo.pSetLayouts = &textureLayout;
         layoutInfo.pushConstantRangeCount = 1;
         layoutInfo.pPushConstantRanges = &push;
         check(vkCreatePipelineLayout(device, &layoutInfo, nullptr, &layout), "Create pipeline layout");
 
-        VkShaderModule vertex = compile(VertexShader, shaderc_vertex_shader);
+        makePipeline(VertexShader, FragmentShader, &pipeline);
+        makePipeline(QuadVertexShader, QuadFragmentShader, &quadPipeline);
+    }
+
+    void makePipeline(const char* vertexSource, const char* fragmentSource, VkPipeline* target)
+    {
+        VkShaderModule vertex = compile(vertexSource, shaderc_vertex_shader);
         VkShaderModule fragment = VK_NULL_HANDLE;
         try
         {
-            fragment = compile(FragmentShader, shaderc_fragment_shader);
+            fragment = compile(fragmentSource, shaderc_fragment_shader);
         }
         catch (...)
         {
@@ -376,7 +594,7 @@ class Triangle
         info.pDynamicState = &dynamic;
         info.layout = layout;
         info.renderPass = renderPass;
-        const VkResult result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
+        const VkResult result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, target);
         vkDestroyShaderModule(device, fragment, nullptr);
         vkDestroyShaderModule(device, vertex, nullptr);
         check(result, "Create pipeline");
@@ -528,15 +746,19 @@ class Triangle
         pass.pClearValues = &clear;
         vkCmdBeginRenderPass(command, &pass, VK_SUBPASS_CONTENTS_INLINE);
         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-        const VkViewport viewport{0.0f, 0.0f, static_cast<float>(extent.width), static_cast<float>(extent.height), 0.0f, 1.0f};
+        // 左右各占一半视口，保持图形比例并避免重叠。
+        constexpr float PanelFraction = 0.5f;
+        VkViewport viewport{0.0f, 0.0f, static_cast<float>(extent.width) * PanelFraction,
+            static_cast<float>(extent.height), 0.0f, 1.0f};
         const VkRect2D scissor{{0, 0}, extent};
         vkCmdSetViewport(command, 0, 1, &viewport);
         vkCmdSetScissor(command, 0, 1, &scissor);
 
         // 等比例缩放顶点；push constants 省去顶点缓冲。
         constexpr float TriangleRadius = 0.65f;
-        const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
-        const glm::vec2 scale = TriangleRadius * glm::vec2(std::min(1.0f, 1.0f / aspect), std::min(1.0f, aspect));
+        const float aspect = viewport.width / viewport.height;
+        const glm::vec2 fit(std::min(1.0f, 1.0f / aspect), std::min(1.0f, aspect));
+        const glm::vec2 scale = TriangleRadius * fit;
         const glm::vec2 top = glm::vec2(0.0f, -1.0f) * scale;
         const glm::vec2 left = glm::vec2(-glm::sqrt(3.0f) / 2.0f, 0.5f) * scale;
         const glm::vec2 right = glm::vec2(glm::sqrt(3.0f) / 2.0f, 0.5f) * scale;
@@ -545,6 +767,16 @@ class Triangle
             glm::vec4(1.0f, 0.0f, 0.0f, 1.0f), glm::vec4(0.0f, 1.0f, 0.0f, 1.0f), glm::vec4(0.0f, 0.0f, 1.0f, 1.0f)};
         vkCmdPushConstants(command, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(vertices), vertices.data());
         vkCmdDraw(command, VertexCount, 1, 0, 0);
+
+        // 正方形使用独立着色器，通过描述符采样棋盘格。
+        constexpr float SquareHalfSize = 0.55f;
+        viewport.x = viewport.width;
+        vkCmdSetViewport(command, 0, 1, &viewport);
+        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, quadPipeline);
+        vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &textureSet, 0, nullptr);
+        const glm::vec4 squareScale(SquareHalfSize * fit, 0.0f, 0.0f);
+        vkCmdPushConstants(command, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(squareScale), &squareScale);
+        vkCmdDraw(command, QuadVertexCount, 1, 0, 0);
         vkCmdEndRenderPass(command);
         check(vkEndCommandBuffer(command), "End commands");
     }
@@ -601,9 +833,11 @@ class Triangle
         }
         frames.clear();
         vkDestroyPipeline(device, pipeline, nullptr);
+        vkDestroyPipeline(device, quadPipeline, nullptr);
         vkDestroyPipelineLayout(device, layout, nullptr);
         vkDestroyRenderPass(device, renderPass, nullptr);
         pipeline = VK_NULL_HANDLE;
+        quadPipeline = VK_NULL_HANDLE;
         layout = VK_NULL_HANDLE;
         renderPass = VK_NULL_HANDLE;
         for (auto view : views)
@@ -630,6 +864,14 @@ class Triangle
             vkDestroyFence(device, fence, nullptr);
             vkDestroySemaphore(device, acquired, nullptr);
             vkDestroyCommandPool(device, pool, nullptr);
+            vkDestroyDescriptorPool(device, descriptors, nullptr);
+            vkDestroyDescriptorSetLayout(device, textureLayout, nullptr);
+            vkDestroySampler(device, sampler, nullptr);
+            vkDestroyImageView(device, textureView, nullptr);
+            vkDestroyImage(device, texture, nullptr);
+            vkFreeMemory(device, textureMemory, nullptr);
+            vkDestroyBuffer(device, uploadBuffer, nullptr);
+            vkFreeMemory(device, uploadMemory, nullptr);
             vkDestroyDevice(device, nullptr);
         }
         if (surface)
@@ -662,6 +904,7 @@ class Triangle
         createInstance();
         createDevice();
         createCommands();
+        createTexture();
         createSwapchain();
         glfwShowWindow(window);
         while (!glfwWindowShouldClose(window))
